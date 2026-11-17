@@ -25,6 +25,7 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import os
 import unittest
 from typing import Any, Mapping, cast
 from unittest import mock
@@ -40,8 +41,11 @@ from fido2.ctap2 import (
     ClientPin,
     Ctap2,
     Info,
+    LargeBlobArrayError,
+    LargeBlobs,
     PinProtocolV1,
 )
+from fido2.utils import sha256
 from fido2.webauthn import AttestationObject, AttestedCredentialData, AuthenticatorData
 
 _AAGUID = bytes.fromhex("F8A011F38C0A4D15800617111F9EDC7D")
@@ -366,3 +370,147 @@ class TestClientPin(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             prot.set_pin("1" * 256)
+
+
+def _encode_array(entries):
+    """Serializes a Large Blobs array the way write_blob_array() would."""
+    data = cbor.encode(entries)
+    return data + sha256(data)[:16]
+
+
+def _corrupt(buf):
+    """Flips a payload byte so the appended checksum no longer matches."""
+    return b"\xff" + buf[1:]
+
+
+class _FakeLargeBlobStore:
+    """In-memory stand-in for an authenticator's large blob storage area."""
+
+    def __init__(self):
+        self.storage = b""
+        self.write_count = 0
+        info = mock.MagicMock()
+        info.options = {"largeBlobs": True}
+        info.max_msg_size = 1200
+        self.ctap = mock.MagicMock()
+        self.ctap.info = info
+        self.ctap.large_blobs.side_effect = self.large_blobs
+
+    def large_blobs(self, offset, get=None, set=None, length=None, **kwargs):
+        if set is not None:
+            self.write_count += 1
+            if offset == 0:
+                # The first fragment sets the total length of the new array.
+                self.storage = set + b"\0" * ((length or len(set)) - len(set))
+            else:
+                self.storage = (
+                    self.storage[:offset]
+                    + set
+                    + self.storage[offset + len(set):]
+                )
+            return {1: b""}
+        return {1: self.storage[offset : offset + get]}
+
+    def client(self, strict=True):
+        return LargeBlobs(self.ctap, strict=strict)
+
+
+class TestLargeBlobs(unittest.TestCase):
+    def test_corrupt_array_read_fails_explicitly(self):
+        store = _FakeLargeBlobStore()
+        store.storage = _corrupt(_encode_array([{1: b"irrecoverable-entry"}]))
+        lb = store.client()
+
+        # A corrupt array must never masquerade as an empty array.
+        with self.assertRaises(LargeBlobArrayError):
+            lb.read_blob_array()
+        # The error is a ValueError subclass for backwards-compatible except clauses.
+        with self.assertRaises(ValueError):
+            lb.read_blob_array()
+        # get_blob propagates the integrity failure rather than returning None.
+        with self.assertRaises(LargeBlobArrayError):
+            lb.get_blob(os.urandom(32))
+
+        # A payload shorter than the 16 byte checksum is likewise corrupt, not empty.
+        store.storage = b"short"
+        with self.assertRaises(LargeBlobArrayError):
+            lb.read_blob_array()
+
+    def test_legacy_strict_false_only_relaxes_reads(self):
+        store = _FakeLargeBlobStore()
+        store.storage = _corrupt(_encode_array([{1: b"legacy-entry"}]))
+        lb = store.client(strict=False)
+
+        # Legacy behavior: a corrupt read is reported as an empty array.
+        self.assertEqual(lb.read_blob_array(), [])
+
+        # The compatibility switch must not reopen the destructive-overwrite hole:
+        # guarded writes remain fail-closed even in non-strict mode.
+        key = os.urandom(32)
+        with self.assertRaises(LargeBlobArrayError):
+            lb.put_blob(key, b"new data")
+        with self.assertRaises(LargeBlobArrayError):
+            lb.delete_blob(key)
+        self.assertEqual(store.write_count, 0)
+        # The corrupt bytes are untouched.
+        self.assertEqual(store.storage, _corrupt(_encode_array([{1: b"legacy-entry"}])))
+
+    def test_corrupt_array_write_is_rejected(self):
+        store = _FakeLargeBlobStore()
+        original = _corrupt(_encode_array([{1: b"recoverable-entry"}]))
+        store.storage = original
+        lb = store.client()
+        key = os.urandom(32)
+
+        # Both adding and deleting a blob read the whole array first and must abort
+        # before any fragment is written, leaving the recoverable bytes in place.
+        with self.assertRaises(LargeBlobArrayError):
+            lb.put_blob(key, b"new data")
+        with self.assertRaises(LargeBlobArrayError):
+            lb.delete_blob(key)
+        self.assertEqual(store.write_count, 0)
+        self.assertEqual(store.storage, original)
+
+        # write_blob_array stays available as an explicit escape hatch to heal the
+        # storage area once the caller has decided to replace its contents.
+        lb.write_blob_array([])
+        self.assertEqual(store.write_count, 1)
+        self.assertEqual(lb.read_blob_array(), [])
+
+    def test_healthy_array_keeps_three_blobs(self):
+        store = _FakeLargeBlobStore()
+        lb = store.client()
+
+        # A never-used storage area reads as a legitimate, non-corrupt empty array.
+        self.assertEqual(lb.read_blob_array(), [])
+
+        key1, key2, key3 = os.urandom(32), os.urandom(32), os.urandom(32)
+        data1, data2, data3 = b"first blob", b"second blob", b"third blob"
+
+        lb.put_blob(key1, data1)
+        lb.put_blob(key2, data2)
+        lb.put_blob(key3, data3)
+
+        # All three entries coexist: each read-modify-write preserved the others.
+        self.assertEqual(len(lb.read_blob_array()), 3)
+        self.assertEqual(lb.get_blob(key1), data1)
+        self.assertEqual(lb.get_blob(key2), data2)
+        self.assertEqual(lb.get_blob(key3), data3)
+
+        # Replacing one blob leaves the other two physically intact.
+        data1_new = b"replacement"
+        lb.put_blob(key1, data1_new)
+        self.assertEqual(len(lb.read_blob_array()), 3)
+        self.assertEqual(lb.get_blob(key1), data1_new)
+        self.assertEqual(lb.get_blob(key2), data2)
+        self.assertEqual(lb.get_blob(key3), data3)
+
+        # Deleting one blob leaves the other two, and the stored checksum stays valid.
+        lb.delete_blob(key2)
+        remaining = lb.read_blob_array()
+        self.assertEqual(len(remaining), 2)
+        self.assertIsNone(lb.get_blob(key2))
+        self.assertEqual(lb.get_blob(key1), data1_new)
+        self.assertEqual(lb.get_blob(key3), data3)
+        # The bytes on the authenticator carry a matching checksum at all times.
+        self.assertEqual(store.storage, _encode_array(list(remaining)))
